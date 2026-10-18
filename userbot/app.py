@@ -10,6 +10,7 @@ from telethon.tl.functions.updates import GetStateRequest
 from telethon.tl.types import MessageService
 
 from .cloner import Cloner, SkipMessage
+from .commands import Commands, is_command
 from .config import Config
 from .storage import Storage
 
@@ -63,8 +64,10 @@ class App:
         self.client = new_client(cfg)
         self.cloner: Cloner | None = None
         self.me_id = None
+        self.me = None
         self.exclude_ids: set = set()
-        self.only_ids: set = set()
+        self.commands = Commands(self)
+        self.started_at = time.time()
         self.cache: dict = {}
         self.wake = asyncio.Event()
         self.catchup_lock = asyncio.Lock()
@@ -81,18 +84,28 @@ class App:
             raise FatalError("Сессия не авторизована. Сначала выполните вход: python -m userbot login")
 
         me = await self.client.get_me()
-        self.me_id = me.id
+        self.me, self.me_id = me, me.id
         log.info("Вошли как %s (id %s)", utils.get_display_name(me), me.id)
 
         self.cloner = Cloner(self.client, self.cfg, self.store)
         self.exclude_ids = await self._resolve_chats(self.cfg.exclude_chats)
-        self.only_ids = await self._resolve_chats(self.cfg.only_chats)
         self.store.prune(self.cfg.keep_days)
 
+        if self.cfg.forward_private:
+            try:
+                await self.cloner.ensure_private_clone()
+            except FATAL_ERRORS:
+                raise
+            except Exception as e:
+                # не страшно: повторим при первом же сообщении
+                log.warning("Не удалось подготовить клон личек: %r", e)
+
         self.client.add_event_handler(self.on_message, events.NewMessage())
+        self.client.add_event_handler(self.commands.handle, events.NewMessage(outgoing=True))
         self._touch_heartbeat()
 
-        log.info("Клонов: %d, в очереди: %d", len(self.store.sources()), self.store.pending_count())
+        log.info("Клонов групп: %d, пересылка из групп: %s, в очереди: %d", len(self.store.sources()),
+                 "вкл" if self.store.group_forwarding() else "выкл", self.store.pending_count())
         self.spawn(self.catch_up(time.time(), "запуск"))
 
         tasks = [
@@ -161,21 +174,28 @@ class App:
             return False
         if chat_id in self.cloner.clone_ids:
             return False
+        if message.out and is_command(getattr(message, "message", None)):
+            return False
         if message.out and not self.cfg.include_outgoing:
             return False
         if chat_id == self.me_id or chat_id in self.exclude_ids:
             return False
-        if self.only_ids and chat_id not in self.only_ids:
+        if self.store.is_blacklisted(getattr(message, "sender_id", None)) or self.store.is_blacklisted(chat_id):
             return False
-        return self.kind(message, chat) in self.cfg.chat_types
 
-    @staticmethod
-    def kind(message, chat) -> str:
+        if self.store.get_clone(chat_id) is not None:
+            if not self.store.group_forwarding():
+                return False
+            # при догрузке не тащим то, что пришло, пока пересылка была выключена
+            date = getattr(message, "date", None)
+            return date is None or date.timestamp() >= self.store.group_since()
         if message.is_private:
-            return "bot" if getattr(chat, "bot", False) else "private"
-        if message.is_group:
-            return "group"
-        return "channel"
+            if getattr(chat, "bot", False):
+                return self.cfg.forward_bots
+            return self.cfg.forward_private
+        if self.cfg.auto_create_clones and message.is_group:
+            return self.store.group_forwarding()
+        return False
 
     async def on_message(self, event):
         try:
@@ -223,7 +243,7 @@ class App:
         pending_id, chat_id, msg_id, attempts = row
         key = (chat_id, msg_id)
         try:
-            clone_msg_id = await self.cloner.forward(chat_id, msg_id, self.cache.get(key))
+            done = await self.cloner.clone_message(chat_id, msg_id, self.cache.get(key))
         except FATAL_ERRORS:
             raise
         except errors.FloodWaitError as e:
@@ -258,20 +278,26 @@ class App:
                 await asyncio.sleep(min(60, 2 ** attempts))
             return
 
-        self.store.mark_forwarded(chat_id, msg_id, clone_msg_id)
+        for done_id, clone_msg_id in done:  # у альбома несколько сообщений
+            self.store.mark_forwarded(chat_id, done_id, clone_msg_id)
+            self.cache.pop((chat_id, done_id), None)
         self.cache.pop(key, None)
         log.debug("Переслано %s/%s", chat_id, msg_id)
 
     # --- догрузка пропущенного ---------------------------------------------
 
     async def catch_up(self, before_ts: float, reason: str):
-        """Для каждого чата с клоном забирает сообщения новее последнего
-        обработанного до before_ts и ставит их в очередь (дубли отсекаются)."""
+        """Для каждого известного чата забирает сообщения новее последнего
+        обработанного до before_ts и ставит их в очередь (дубли отсекаются).
+        Плюс лички с непрочитанными, из которых ещё ничего не пересылалось."""
         if self.catchup_lock.locked():
             return
         async with self.catchup_lock:
             total = 0
-            for chat_id in self.store.sources():
+            # лички (id > 0) и клонируемые группы; старые группы без клона не трогаем
+            known = [c for c in self.store.known_sources()
+                     if c > 0 or self.cfg.auto_create_clones or self.store.get_clone(c) is not None]
+            for chat_id in known:
                 last = self.store.last_forwarded_id(chat_id, before_ts)
                 if last is None or chat_id in self.exclude_ids:
                     continue
@@ -293,8 +319,26 @@ class App:
                 except Exception as e:
                     log.debug("Догрузка чата %s не удалась: %r", chat_id, e)
                 await asyncio.sleep(0.5)  # бережём лимиты API
+            if self.cfg.forward_private:
+                try:
+                    total += await self._catch_up_new_private(set(known))
+                except FATAL_ERRORS:
+                    raise
+                except Exception as e:
+                    log.debug("Догрузка новых личек не удалась: %r", e)
             if total:
                 log.info("Догрузка (%s): найдено пропущенных сообщений: %d", reason, total)
+
+    async def _catch_up_new_private(self, known: set) -> int:
+        total = 0
+        async for d in self.client.iter_dialogs(limit=50):
+            if not d.is_user or d.id in known or not d.unread_count:
+                continue
+            unread = [m async for m in self.client.iter_messages(d.input_entity, limit=min(d.unread_count, 50))]
+            for m in reversed(unread):  # по порядку, от старых к новым
+                if self.accept(m, d.id, d.entity) and self.enqueue(d.id, m):
+                    total += 1
+        return total
 
     # --- сторож ------------------------------------------------------------
 

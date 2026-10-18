@@ -44,9 +44,14 @@ def status(cfg):
     from .storage import Storage
     store = Storage(cfg.db_path)
     db = store.db
-    print(f"Клонов: {len(store.sources())}")
-    for source_id, clone_id, title in db.execute("SELECT source_id, clone_id, title FROM clones ORDER BY created_at"):
+    print(f"Клон личек: {store.private_clone() or 'ещё не создан'}")
+    print(f"Пересылка из групп: {'вкл' if store.group_forwarding() else 'выкл'}")
+    print(f"Клонов групп: {len(store.groups())}")
+    for source_id, clone_id, title in store.groups():
         print(f"  {source_id} → {clone_id}  {title}")
+    print(f"Чёрный список: {len(store.blacklist())}")
+    for user_id, name in store.blacklist():
+        print(f"  {user_id}  {name}")
     print(f"В очереди: {store.pending_count()}")
     rows = db.execute("SELECT source_id, msg_id, error, failed_at FROM failed ORDER BY failed_at DESC LIMIT 20").fetchall()
     print(f"Не переслано (последние {len(rows)}):")

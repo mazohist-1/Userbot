@@ -6,9 +6,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-CHAT_KINDS = {"private", "bot", "group", "channel"}
-
-
 def _bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -47,13 +44,19 @@ class Config:
     session_path: Path
     db_path: Path
 
-    chat_types: frozenset
+    forward_private: bool
+    forward_bots: bool
     include_outgoing: bool
     exclude_chats: frozenset
-    only_chats: frozenset
+    auto_create_clones: bool
 
-    clone_prefix: str
+    private_clone_title: str
+    group_clone_prefix: str
     archive_clones: bool
+
+    cmd_reply: str
+    get_limit: int
+    search_limit: int
 
     catchup_interval: int
     catchup_limit: int
@@ -76,10 +79,9 @@ def load() -> Config:
     data_dir = Path(os.getenv("DATA_DIR", "data")).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    chat_types = frozenset(t.lower() for t in _list("CHAT_TYPES", "private,group"))
-    unknown = chat_types - CHAT_KINDS
-    if unknown:
-        raise SystemExit(f"CHAT_TYPES: неизвестные типы {sorted(unknown)}, допустимы {sorted(CHAT_KINDS)}")
+    cmd_reply = os.getenv("CMD_REPLY", "saved").strip().lower()
+    if cmd_reply not in {"saved", "here"}:
+        raise SystemExit("CMD_REPLY: допустимо saved или here")
 
     return Config(
         api_id=int(api_id),
@@ -87,14 +89,19 @@ def load() -> Config:
         data_dir=data_dir,
         session_path=data_dir / os.getenv("SESSION_NAME", "userbot"),
         db_path=data_dir / "state.db",
-        chat_types=chat_types,
+        forward_private=_bool("FORWARD_PRIVATE", True),
+        forward_bots=_bool("FORWARD_BOTS", False),
         include_outgoing=_bool("INCLUDE_OUTGOING", False),
         # 777000 — служебный чат Telegram с кодами входа. Если переслать код
         # куда-либо, Telegram его аннулирует, поэтому он исключён по умолчанию.
         exclude_chats=_chats("EXCLUDE_CHATS") | {777000},
-        only_chats=_chats("ONLY_CHATS"),
-        clone_prefix=os.getenv("CLONE_PREFIX", "📥 "),
-        archive_clones=_bool("ARCHIVE_CLONES", True),
+        auto_create_clones=_bool("AUTO_CREATE_CLONES", False),
+        private_clone_title=os.getenv("PRIVATE_CLONE_TITLE", "Private Messages").strip() or "Private Messages",
+        group_clone_prefix=os.getenv("GROUP_CLONE_PREFIX", "Clone: "),
+        archive_clones=_bool("ARCHIVE_CLONES", False),
+        cmd_reply=cmd_reply,
+        get_limit=_int("GET_LIMIT", 100),
+        search_limit=_int("SEARCH_LIMIT", 20),
         catchup_interval=_int("CATCHUP_INTERVAL_MIN", 30) * 60,
         catchup_limit=_int("CATCHUP_LIMIT", 500),
         max_retries=_int("MAX_RETRIES", 5),

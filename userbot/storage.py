@@ -1,16 +1,21 @@
 """Постоянное состояние бота в SQLite.
 
 Хранит:
-  clones    — соответствие «исходный чат → чат-клон»;
-  forwarded — какие сообщения уже пересланы (защита от дублей и точка
-              отсчёта для догрузки пропущенного);
-  pending   — очередь сообщений на пересылку, переживает перезапуск;
-  failed    — сообщения, которые так и не удалось переслать.
+  clones        — клоны групп, добавленные командой .clone add;
+  settings      — id клона «Private Messages», пересылка из групп вкл/выкл;
+  blacklist     — пользователи, чьи сообщения не пересылаются;
+  legacy_clones — бывшие клоны (их сообщения никогда не пересылаются как обычный чат);
+  forwarded     — какие сообщения уже пересланы (защита от дублей и точка
+                  отсчёта для догрузки пропущенного);
+  pending       — очередь сообщений на пересылку, переживает перезапуск;
+  failed        — сообщения, которые так и не удалось переслать.
 """
 
 import sqlite3
 import time
 from typing import Optional
+
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clones (
@@ -18,6 +23,18 @@ CREATE TABLE IF NOT EXISTS clones (
     clone_id   INTEGER NOT NULL UNIQUE,
     title      TEXT,
     created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS blacklist (
+    user_id  INTEGER PRIMARY KEY,
+    name     TEXT,
+    added_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS legacy_clones (
+    clone_id INTEGER PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS forwarded (
     source_id    INTEGER NOT NULL,
@@ -52,11 +69,55 @@ class Storage:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version < 2:
+            # версия 1 создавала клон на каждый чат автоматически. Теперь лички идут
+            # в один клон, а группы — только добавленные вручную, поэтому старые
+            # клоны отключаем (сами каналы остаются в Telegram).
+            with self.db:
+                self.db.execute("BEGIN")
+                self.db.execute("INSERT OR IGNORE INTO legacy_clones SELECT clone_id FROM clones")
+                self.db.execute("DELETE FROM clones")
+        self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def close(self):
         self.db.close()
 
-    # --- клоны -------------------------------------------------------------
+    # --- настройки ---------------------------------------------------------
+
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row and row[0] is not None else default
+
+    def set_setting(self, key: str, value):
+        if value is None:
+            self.db.execute("DELETE FROM settings WHERE key=?", (key,))
+        else:
+            self.db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, str(value)))
+
+    def private_clone(self) -> Optional[int]:
+        value = self.get_setting("private_clone")
+        return int(value) if value else None
+
+    def set_private_clone(self, clone_id: Optional[int]):
+        self.set_setting("private_clone", clone_id)
+
+    def group_forwarding(self) -> bool:
+        return self.get_setting("group_forwarding", "1") == "1"
+
+    def group_since(self) -> float:
+        """С какого момента пересылка из групп включена (для догрузки)."""
+        return float(self.get_setting("group_since", "0"))
+
+    def set_group_forwarding(self, on: bool):
+        self.set_setting("group_forwarding", "1" if on else "0")
+        if on:
+            self.set_setting("group_since", time.time())
+
+    # --- клоны групп -------------------------------------------------------
 
     def get_clone(self, source_id: int) -> Optional[int]:
         row = self.db.execute("SELECT clone_id FROM clones WHERE source_id=?", (source_id,)).fetchone()
@@ -68,14 +129,49 @@ class Storage:
             (source_id, clone_id, title, time.time()),
         )
 
-    def delete_clone(self, source_id: int):
-        self.db.execute("DELETE FROM clones WHERE source_id=?", (source_id,))
+    def delete_clone(self, source_id: int) -> Optional[int]:
+        """Убирает клон из списка. Возвращает id канала-клона, если он был."""
+        clone_id = self.get_clone(source_id)
+        if clone_id is not None:
+            self.add_legacy(clone_id)
+            self.db.execute("DELETE FROM clones WHERE source_id=?", (source_id,))
+        return clone_id
 
-    def clone_ids(self) -> set:
-        return {r[0] for r in self.db.execute("SELECT clone_id FROM clones")}
+    def groups(self) -> list:
+        """[(source_id, clone_id, title)] в порядке добавления."""
+        return self.db.execute("SELECT source_id, clone_id, title FROM clones ORDER BY created_at").fetchall()
 
     def sources(self) -> list:
         return [r[0] for r in self.db.execute("SELECT source_id FROM clones")]
+
+    def add_legacy(self, clone_id: int):
+        self.db.execute("INSERT OR IGNORE INTO legacy_clones (clone_id) VALUES (?)", (clone_id,))
+
+    def clone_ids(self) -> set:
+        """Все чаты, которые являются клонами (их сообщения не пересылаются)."""
+        ids = {r[0] for r in self.db.execute("SELECT clone_id FROM clones UNION SELECT clone_id FROM legacy_clones")}
+        private = self.private_clone()
+        if private:
+            ids.add(private)
+        return ids
+
+    # --- чёрный список -----------------------------------------------------
+
+    def blacklist_add(self, user_id: int, name: str) -> bool:
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO blacklist (user_id, name, added_at) VALUES (?,?,?)", (user_id, name, time.time()))
+        return cur.rowcount > 0
+
+    def blacklist_remove(self, user_id: int) -> bool:
+        return self.db.execute("DELETE FROM blacklist WHERE user_id=?", (user_id,)).rowcount > 0
+
+    def blacklist(self) -> list:
+        return self.db.execute("SELECT user_id, name FROM blacklist ORDER BY added_at").fetchall()
+
+    def is_blacklisted(self, user_id) -> bool:
+        if user_id is None:
+            return False
+        return self.db.execute("SELECT 1 FROM blacklist WHERE user_id=?", (user_id,)).fetchone() is not None
 
     # --- пересланные -------------------------------------------------------
 
@@ -99,6 +195,14 @@ class Storage:
             "SELECT MAX(msg_id) FROM forwarded WHERE source_id=? AND done_at<?", (source_id, before_ts)
         ).fetchone()
         return row[0] if row and row[0] is not None else None
+
+    def known_sources(self) -> list:
+        """Чаты, из которых уже что-то пересылалось, плюс клонируемые группы."""
+        return [r[0] for r in self.db.execute(
+            "SELECT DISTINCT source_id FROM forwarded UNION SELECT source_id FROM clones")]
+
+    def last_forwarded_at(self) -> Optional[float]:
+        return self.db.execute("SELECT MAX(done_at) FROM forwarded").fetchone()[0]
 
     def prune(self, keep_days: int):
         """Удаляет старые записи, но последнюю по каждому чату оставляет —
@@ -131,6 +235,9 @@ class Storage:
 
     def pending_count(self) -> int:
         return self.db.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
+
+    def failed_count(self, since: float = 0) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM failed WHERE failed_at>=?", (since,)).fetchone()[0]
 
     def bump_attempts(self, pending_id: int):
         self.db.execute("UPDATE pending SET attempts=attempts+1 WHERE id=?", (pending_id,))
