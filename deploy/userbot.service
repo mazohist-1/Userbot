@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram userbot (клонирование чатов)
+After=network-online.target
+Wants=network-online.target
+# никогда не прекращать попытки перезапуска
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=userbot
+WorkingDirectory=/opt/userbot
+ExecStart=/opt/userbot/venv/bin/python -m userbot
+Restart=always
+RestartSec=10
+# код 3 — сессия недействительна, нужен повторный вход; перезапуск не поможет
+RestartPreventExitStatus=3
+Environment=PYTHONUNBUFFERED=1
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

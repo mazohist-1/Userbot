@@ -1,0 +1,17 @@
+services:
+  userbot:
+    build: .
+    container_name: userbot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+      FATAL_EXIT_DELAY_SEC: "600"   # если сессия слетела, не долбить Telegram перезапусками
+    volumes:
+      - ./data:/app/data
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
