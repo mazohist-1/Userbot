@@ -25,7 +25,7 @@ from .links import Link, LinkError, parse_link
 log = logging.getLogger(__name__)
 
 CMD_RE = re.compile(r"^\.([A-Za-z]+)(?=\s|$)")
-COMMANDS = {"get", "getm", "unread", "ex", "rm", "list", "aaa", "clone", "group", "status", "commands", "help"}
+COMMANDS = {"get", "getm", "getmu", "unread", "ex", "rm", "list", "aaa", "clone", "group", "status", "commands", "help"}
 
 HELP = """<b>Команды юзербота</b> (сообщение с командой сразу удаляется)
 
@@ -35,6 +35,8 @@ HELP = """<b>Команды юзербота</b> (сообщение с кома
 <code>.get lastI N [ссылка]</code> — последние N фотографий
 <code>.get search "текст" [ссылка]</code> — поиск по тексту
 <code>.getM [N] &lt;ссылка&gt;</code> — все медиа: видео, фото, GIF и файлы (ссылка на сообщение — из него/альбома, на чат или тему — из всего чата)
+<code>.getMU [N] &lt;ссылка на сообщение&gt;</code> — все медиа автора этого сообщения в том чате
+<code>.getMU [N] &lt;ссылка на чат&gt; @user|ID</code> — все медиа этого пользователя в чате
 <code>.unread [N]</code> — непрочитанное из чатов с включёнными уведомлениями (до N из каждого)
 <code>.unread list</code> — только список таких чатов
 <code>.ex @user</code> — в чёрный список (можно ID или ответом на сообщение)
@@ -334,6 +336,71 @@ class Commands:
         sent = await self.deliver_media(ctx, list(reversed(media)), chat)  # от старых к новым
         note = f" (лимит {limit}, больше: <code>.getM N ссылка</code>)" if len(media) >= limit else ""
         return f"✅ Отправлено медиа: {sent}{note}"
+
+    async def cmd_getmu(self, args, ctx):
+        limit = self.app.cfg.getm_limit
+        if args and re.fullmatch(r"\d+", args[0]):
+            limit = parse_count(args.pop(0), limit)
+        usage = "Формат: .getMU [N] <ссылка на сообщение> или .getMU [N] <ссылка на чат> @user|ID"
+
+        if not args:
+            if not ctx.reply_id:
+                raise UsageError(usage)
+            # ответом на сообщение: автор этого сообщения в текущем чате
+            chat, thread = await self._chat(ctx.chat) or ctx.chat, ctx.topic
+            message = await self.client.get_messages(ctx.chat, ids=ctx.reply_id)
+            if message is None:
+                return "⚠️ Сообщение не найдено"
+            author, author_id = await message.get_input_sender(), message.sender_id
+        elif len(args) == 1:
+            link = parse_link(args[0])
+            if link.msg_id is None:
+                raise UsageError("Это ссылка на чат: укажите вторым параметром @user или ID. " + usage)
+            chat = await self.cloner.entity(link.chat)
+            thread = link.thread
+            message = await self.client.get_messages(chat, ids=link.msg_id)
+            if message is None:
+                return "⚠️ Сообщение не найдено (удалено или нет доступа)"
+            author, author_id = await message.get_input_sender(), message.sender_id
+        else:
+            chat, thread = await self._target(args[0], ctx)
+            author, author_id = await self._author(args[1])
+        if author_id is None:
+            return "⚠️ У этого сообщения нет автора (например, пост канала без подписи)"
+
+        media = []
+        if author is not None:
+            found = self.client.iter_messages(chat, from_user=author, reply_to=thread)
+        else:
+            # пользователь не в кэше: перебираем историю и сверяем ID автора
+            found = self.client.iter_messages(chat, reply_to=thread, limit=self.app.cfg.getm_scan_limit)
+        async for m in found:
+            if m.sender_id == author_id and is_media_file(m):
+                media.append(m)
+                if len(media) >= limit:
+                    break
+        name = await self._name(author_id)
+        if not media:
+            return f"🔍 У {esc(name)} в этом чате нет видео, фото, GIF или файлов"
+        sent = await self.deliver_media(ctx, list(reversed(media)), chat)  # от старых к новым
+        note = f" (лимит {limit}, больше: <code>.getMU N …</code>)" if len(media) >= limit else ""
+        return f"✅ Отправлено медиа от {esc(name)}: {sent}{note}"
+
+    async def _author(self, raw: str):
+        """@user, ID или ссылка → (input-сущность или None, id)."""
+        try:
+            entity = await self.peer_from_arg(raw)
+            return utils.get_input_peer(entity), utils.get_peer_id(entity)
+        except (ValueError, LinkError):
+            if re.fullmatch(r"\d+", raw):
+                return None, int(raw)
+            raise
+
+    async def _name(self, peer_id) -> str:
+        try:
+            return utils.get_display_name(await self.client.get_entity(peer_id)) or str(peer_id)
+        except Exception:
+            return str(peer_id)
 
     async def deliver_media(self, ctx, media: list, chat) -> int:
         """Отправляет медиа пачками по 10: фото и видео вместе, файлы вместе, GIF по одному."""

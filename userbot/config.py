@@ -57,6 +57,7 @@ class Config:
     cmd_reply: str
     get_limit: int
     getm_limit: int
+    getm_scan_limit: int
     unread_per_chat: int
     search_limit: int
 
@@ -104,6 +105,7 @@ def load() -> Config:
         cmd_reply=cmd_reply,
         get_limit=_int("GET_LIMIT", 100),
         getm_limit=_int("GETM_LIMIT", 500),
+        getm_scan_limit=_int("GETM_SCAN_LIMIT", 20000),
         unread_per_chat=_int("UNREAD_PER_CHAT", 20),
         search_limit=_int("SEARCH_LIMIT", 20),
         catchup_interval=_int("CATCHUP_INTERVAL_MIN", 30) * 60,

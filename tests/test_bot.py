@@ -538,6 +538,59 @@ class CommandsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent, [10, 5])
         self.assertIn("лимит 15", self.answer()[1])
 
+    async def _getmu(self, args, history, **kw):
+        self.app.client.iter_messages = history
+        self.app.cloner.send_copy = AsyncMock(return_value=1)
+        for k, v in kw.items():
+            setattr(self.app.client, k, v)
+        orig = asyncio.sleep
+        asyncio.sleep = AsyncMock()
+        try:
+            await self.cmd.run("getmu", args, self.ctx)
+        finally:
+            asyncio.sleep = orig
+        return [len(c.args[1]) for c in self.app.cloner.send_copy.await_args_list]
+
+    def _media_from(self, sender):
+        photo = MessageMediaPhoto(photo=Photo(id=1, access_hash=1, file_reference=b"", date=None, sizes=[], dc_id=1))
+        return Message(id=1, peer_id=PeerUser(5), date=None, message="", media=photo, from_id=PeerUser(sender))
+
+    async def test_getmu_message_link_uses_author(self):
+        src = self._media_from(7)
+        src.get_input_sender = AsyncMock(return_value="author7")
+        calls = []
+
+        async def history(chat, from_user=None, reply_to=None, limit=None):
+            calls.append(from_user)
+            for _ in range(3):
+                yield self._media_from(7)
+
+        sent = await self._getmu(["https://t.me/kanal/9"], history,
+                                 get_entity=AsyncMock(return_value=chan(5, "Канал")),
+                                 get_messages=AsyncMock(return_value=src))
+        self.assertEqual(calls, ["author7"])
+        self.assertEqual(sent, [3])
+
+    async def test_getmu_chat_and_unknown_id_scans_history(self):
+        async def history(chat, from_user=None, reply_to=None, limit=None):
+            self.assertIsNone(from_user)
+            for sender in (7, 8, 7):
+                yield self._media_from(sender)
+
+        async def entity(peer):
+            if peer == "kanal":
+                return chan(5, "Канал")
+            raise ValueError("нет в кэше")
+
+        self.app.cloner._load_dialogs = AsyncMock(return_value=False)
+        sent = await self._getmu(["https://t.me/kanal", "7"], history, get_entity=AsyncMock(side_effect=entity))
+        self.assertEqual(sent, [2])
+        self.assertIn("Отправлено медиа от 7: 2", self.answer()[1])
+
+    async def test_getmu_chat_link_needs_user(self):
+        await self.cmd.run("getmu", ["https://t.me/kanal"], self.ctx)
+        self.assertIn("укажите вторым параметром", self.answer()[1])
+
     def test_is_muted(self):
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
         later, earlier = datetime(2027, 1, 1, tzinfo=timezone.utc), datetime(2025, 1, 1, tzinfo=timezone.utc)
