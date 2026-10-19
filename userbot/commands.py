@@ -10,10 +10,14 @@ import logging
 import re
 import shlex
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from telethon import errors, utils
-from telethon.tl.types import InputMessagesFilterPhotos, User
+from telethon.tl.functions.account import GetNotifySettingsRequest
+from telethon.tl.types import (
+    InputMessagesFilterPhotos, InputNotifyBroadcasts, InputNotifyChats, InputNotifyUsers, User,
+)
 
 from .cloner import Rich, media_kind, units
 from .links import Link, LinkError, parse_link
@@ -21,7 +25,7 @@ from .links import Link, LinkError, parse_link
 log = logging.getLogger(__name__)
 
 CMD_RE = re.compile(r"^\.([A-Za-z]+)(?=\s|$)")
-COMMANDS = {"get", "getm", "ex", "rm", "list", "aaa", "clone", "group", "status", "commands", "help"}
+COMMANDS = {"get", "getm", "unread", "ex", "rm", "list", "aaa", "clone", "group", "status", "commands", "help"}
 
 HELP = """<b>Команды юзербота</b> (сообщение с командой сразу удаляется)
 
@@ -31,6 +35,8 @@ HELP = """<b>Команды юзербота</b> (сообщение с кома
 <code>.get lastI N [ссылка]</code> — последние N фотографий
 <code>.get search "текст" [ссылка]</code> — поиск по тексту
 <code>.getM [N] &lt;ссылка&gt;</code> — все медиа: видео, фото, GIF и файлы (ссылка на сообщение — из него/альбома, на чат или тему — из всего чата)
+<code>.unread [N]</code> — непрочитанное из чатов с включёнными уведомлениями (до N из каждого)
+<code>.unread list</code> — только список таких чатов
 <code>.ex @user</code> — в чёрный список (можно ID или ответом на сообщение)
 <code>.rm @user</code> — убрать из чёрного списка
 <code>.list</code> — чёрный список
@@ -65,6 +71,18 @@ def media_batches(media: list) -> list:
             out.append([m])
         last = group
     return out
+
+
+def is_muted(settings, default=None, now=None) -> bool:
+    """Выключены ли уведомления: своя настройка чата, иначе общая для его типа."""
+    now = now or datetime.now(timezone.utc)
+    for s in (settings, default):
+        until = getattr(s, "mute_until", None)
+        if until is not None:
+            if isinstance(until, (int, float)):
+                until = datetime.fromtimestamp(until, timezone.utc)
+            return until > now
+    return False
 
 
 class UsageError(Exception):
@@ -328,6 +346,58 @@ class Commands:
             done += len(batch)
             await asyncio.sleep(1)  # бережём лимиты API
         return done
+
+    # --- .unread ---------------------------------------------------------
+
+    async def unread_chats(self) -> list:
+        """[(диалог, сколько непрочитанных)] для чатов с включёнными уведомлениями."""
+        defaults = {}
+        for key, peer in (("user", InputNotifyUsers()), ("chat", InputNotifyChats()),
+                          ("channel", InputNotifyBroadcasts())):
+            try:
+                defaults[key] = await self.client(GetNotifySettingsRequest(peer))
+            except Exception as e:
+                log.debug("Не удалось получить общие настройки уведомлений (%s): %r", key, e)
+        skip = self.cloner.clone_ids | {self.app.me_id} | set(self.app.exclude_ids)
+        out = []
+        async for d in self.client.iter_dialogs():
+            count = d.unread_count or (1 if getattr(d.dialog, "unread_mark", False) else 0)
+            if not count or d.id in skip:
+                continue
+            kind = "user" if d.is_user else "chat" if d.is_group else "channel"
+            if is_muted(d.dialog.notify_settings, defaults.get(kind)):
+                continue
+            out.append((d, count))
+        return out
+
+    async def cmd_unread(self, args, ctx):
+        only_list = bool(args) and args[0].lower() == "list"
+        per_chat = self.app.cfg.unread_per_chat
+        if args and not only_list:
+            per_chat = parse_count(args[0], self.app.cfg.get_limit)
+
+        chats = await self.unread_chats()
+        if not chats:
+            return "📭 Непрочитанного в чатах с включёнными уведомлениями нет"
+        lines = [f"<b>Непрочитанное ({sum(c for _, c in chats)}) в {len(chats)} чатах</b>"]
+        lines += [f"• {esc(d.name or d.id)} — {c}" for d, c in chats]
+        if only_list:
+            return "\n".join(lines)
+
+        sent = 0
+        for d, count in chats:
+            found = [m async for m in self.client.iter_messages(
+                d.input_entity, min_id=d.dialog.read_inbox_max_id, limit=min(count, per_chat))]
+            found = [m for m in reversed(found) if not getattr(m, "action", None)]
+            if not found:  # чат помечен непрочитанным вручную: берём последнее
+                found = [m async for m in self.client.iter_messages(d.input_entity, limit=1)]
+            for unit in units(found):
+                header = await self.cloner.header(unit[0], d.id, group=not d.is_user, count=len(unit))
+                await self.cloner.send_copy(ctx.chat, unit, header, reply_to=ctx.topic)
+                sent += len(unit)
+                await asyncio.sleep(0.5)  # бережём лимиты API
+        lines.append(f"\n✅ Прислано сообщений: {sent}. В самих чатах они остались непрочитанными.")
+        return "\n".join(lines)
 
     # --- чёрный список -----------------------------------------------------
 

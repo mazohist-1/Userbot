@@ -24,7 +24,7 @@ from telethon.tl.types import (  # noqa: E402
 from userbot import config  # noqa: E402
 from userbot.app import App  # noqa: E402
 from userbot.cloner import Cloner, Rich, SkipMessage, media_kind, units  # noqa: E402
-from userbot.commands import Commands, is_command, media_batches, split_args, topic_of  # noqa: E402
+from userbot.commands import Commands, is_command, is_muted, media_batches, split_args, topic_of  # noqa: E402
 from userbot.links import Link, LinkError, parse_link  # noqa: E402
 from userbot.storage import Storage  # noqa: E402
 
@@ -537,6 +537,40 @@ class CommandsTest(unittest.IsolatedAsyncioTestCase):
         sent = [len(c.args[1]) for c in self.app.cloner.send_copy.await_args_list]
         self.assertEqual(sent, [10, 5])
         self.assertIn("лимит 15", self.answer()[1])
+
+    def test_is_muted(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        later, earlier = datetime(2027, 1, 1, tzinfo=timezone.utc), datetime(2025, 1, 1, tzinfo=timezone.utc)
+        S = SimpleNamespace
+        self.assertFalse(is_muted(S(mute_until=None), S(mute_until=None), now))
+        self.assertTrue(is_muted(S(mute_until=later), None, now))
+        self.assertFalse(is_muted(S(mute_until=earlier), S(mute_until=later), now))  # своя настройка важнее
+        self.assertTrue(is_muted(S(mute_until=None), S(mute_until=later), now))      # общая для типа чата
+        self.assertTrue(is_muted(S(mute_until=2 ** 31 - 1), None, now))
+
+    async def test_unread_only_from_chats_with_notifications(self):
+        later = datetime(2100, 1, 1, tzinfo=timezone.utc)
+        S = SimpleNamespace
+
+        def dlg(did, unread, muted=False, user=True, mark=False):
+            return S(id=did, name=f"чат{did}", unread_count=unread, is_user=user, is_group=not user,
+                     input_entity=f"p{did}", dialog=S(unread_mark=mark, read_inbox_max_id=0,
+                                                      notify_settings=S(mute_until=later if muted else None)))
+
+        async def dialogs():
+            for d in (dlg(1, 3), dlg(2, 5, muted=True), dlg(3, 0), dlg(777000, 1), dlg(-5, 2, user=False),
+                      dlg(4, 0, mark=True)):
+                yield d
+
+        async def notify(req):
+            return S(mute_until=later if type(req.peer).__name__ == "InputNotifyChats" else None)
+
+        self.app.client = MagicMock(side_effect=notify)
+        self.app.client.iter_dialogs = dialogs
+        self.app.cloner.client = self.app.client
+        self.app.exclude_ids = {777000}
+        chats = await self.cmd.unread_chats()
+        self.assertEqual([(d.id, c) for d, c in chats], [(1, 3), (4, 1)])  # группа -5 заглушена по умолчанию
 
     async def test_status_and_help(self):
         self.app.me = SimpleNamespace(first_name="Я", last_name=None)
