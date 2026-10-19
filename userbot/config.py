@@ -56,6 +56,7 @@ class Config:
 
     cmd_reply: str
     get_limit: int
+    getm_limit: int
     search_limit: int
 
     catchup_interval: int
@@ -101,6 +102,7 @@ def load() -> Config:
         archive_clones=_bool("ARCHIVE_CLONES", False),
         cmd_reply=cmd_reply,
         get_limit=_int("GET_LIMIT", 100),
+        getm_limit=_int("GETM_LIMIT", 500),
         search_limit=_int("SEARCH_LIMIT", 20),
         catchup_interval=_int("CATCHUP_INTERVAL_MIN", 30) * 60,
         catchup_limit=_int("CATCHUP_LIMIT", 500),

@@ -17,14 +17,14 @@ os.environ.setdefault("API_HASH", "x")
 from telethon import errors  # noqa: E402
 from telethon.tl.types import (  # noqa: E402
     Document, DocumentAttributeAudio, DocumentAttributeSticker, DocumentAttributeVideo,
-    Channel, ChatPhotoEmpty, InputStickerSetEmpty, Message, MessageEntityBold, MessageMediaDocument, MessageMediaPhoto,
+    Channel, ChatPhotoEmpty, DocumentAttributeAnimated, InputStickerSetEmpty, Message, MessageEntityBold, MessageMediaDocument, MessageMediaPhoto,
     PeerUser, Photo,
 )
 
 from userbot import config  # noqa: E402
 from userbot.app import App  # noqa: E402
 from userbot.cloner import Cloner, Rich, SkipMessage, media_kind, units  # noqa: E402
-from userbot.commands import Commands, is_command, split_args, topic_of  # noqa: E402
+from userbot.commands import Commands, is_command, media_batches, split_args, topic_of  # noqa: E402
 from userbot.links import Link, LinkError, parse_link  # noqa: E402
 from userbot.storage import Storage  # noqa: E402
 
@@ -493,6 +493,51 @@ class CommandsTest(unittest.IsolatedAsyncioTestCase):
         self.app.client.get_messages.assert_awaited_with("chat", ids=1142)
         self.assertEqual(self.app.cloner.send_copy.await_args.args[0], "here")
 
+    def test_media_batches(self):
+        photo = MessageMediaPhoto(photo=Photo(id=1, access_hash=1, file_reference=b"", date=None, sizes=[], dc_id=1))
+        p, d = tl_msg(photo), tl_msg(doc())
+        gif = tl_msg(doc(DocumentAttributeVideo(duration=1, w=1, h=1), DocumentAttributeAnimated()))
+        sizes = [len(b) for b in media_batches([p] * 12 + [d, d, gif, gif, p])]
+        self.assertEqual(sizes, [10, 2, 2, 1, 1, 1])
+
+    async def test_getm_message_link_sends_album_media(self):
+        photo = MessageMediaPhoto(photo=Photo(id=1, access_hash=1, file_reference=b"", date=None, sizes=[], dc_id=1))
+        album = [tl_msg(photo), tl_msg(doc(DocumentAttributeAudio(duration=1, voice=True))), tl_msg(doc())]
+        self.app.client.get_entity = AsyncMock(return_value=chan(5, "Канал"))
+        self.app.client.get_messages = AsyncMock(return_value=album[0])
+        self.app.cloner.album_of = AsyncMock(return_value=album)
+        self.app.cloner.send_copy = AsyncMock(return_value=1)
+        orig = asyncio.sleep
+        asyncio.sleep = AsyncMock()
+        try:
+            await self.cmd.run("getm", ["https://t.me/kanal/7"], self.ctx)
+        finally:
+            asyncio.sleep = orig
+        sent = [len(c.args[1]) for c in self.app.cloner.send_copy.await_args_list]
+        self.assertEqual(sent, [1, 1])  # голосовое пропущено, фото и файл разными пачками
+        self.assertIn("Отправлено медиа: 2", self.answer()[1])
+
+    async def test_getm_chat_link_respects_limit(self):
+        photo = MessageMediaPhoto(photo=Photo(id=1, access_hash=1, file_reference=b"", date=None, sizes=[], dc_id=1))
+
+        async def history(chat, reply_to=None):
+            for _ in range(30):
+                yield tl_msg(photo)
+                yield tl_msg(text="текст")
+
+        self.app.client.get_entity = AsyncMock(return_value=chan(5, "Канал"))
+        self.app.client.iter_messages = history
+        self.app.cloner.send_copy = AsyncMock(return_value=1)
+        orig = asyncio.sleep
+        asyncio.sleep = AsyncMock()
+        try:
+            await self.cmd.run("getm", ["15", "https://t.me/kanal"], self.ctx)
+        finally:
+            asyncio.sleep = orig
+        sent = [len(c.args[1]) for c in self.app.cloner.send_copy.await_args_list]
+        self.assertEqual(sent, [10, 5])
+        self.assertIn("лимит 15", self.answer()[1])
+
     async def test_status_and_help(self):
         self.app.me = SimpleNamespace(first_name="Я", last_name=None)
         self.app.client.is_connected = MagicMock(return_value=True)
@@ -500,6 +545,8 @@ class CommandsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("работает", self.answer()[1])
         await self.cmd.run("commands", [], self.ctx)
         self.assertIn(".get lastI", self.answer()[1])
+        self.assertIn(".getM", self.answer()[1])
+        self.assertTrue(is_command(".getM https://t.me/a/1"))
 
 
 if __name__ == "__main__":

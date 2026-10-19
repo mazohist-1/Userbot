@@ -15,13 +15,13 @@ from types import SimpleNamespace
 from telethon import errors, utils
 from telethon.tl.types import InputMessagesFilterPhotos, User
 
-from .cloner import units
+from .cloner import Rich, media_kind, units
 from .links import Link, LinkError, parse_link
 
 log = logging.getLogger(__name__)
 
 CMD_RE = re.compile(r"^\.([A-Za-z]+)(?=\s|$)")
-COMMANDS = {"get", "ex", "rm", "list", "aaa", "clone", "group", "status", "commands", "help"}
+COMMANDS = {"get", "getm", "ex", "rm", "list", "aaa", "clone", "group", "status", "commands", "help"}
 
 HELP = """<b>Команды юзербота</b> (сообщение с командой сразу удаляется)
 
@@ -30,6 +30,7 @@ HELP = """<b>Команды юзербота</b> (сообщение с кома
 <code>.get last N [ссылка]</code> — последние N сообщений чата или темы
 <code>.get lastI N [ссылка]</code> — последние N фотографий
 <code>.get search "текст" [ссылка]</code> — поиск по тексту
+<code>.getM [N] &lt;ссылка&gt;</code> — все медиа: видео, фото, GIF и файлы (ссылка на сообщение — из него/альбома, на чат или тему — из всего чата)
 <code>.ex @user</code> — в чёрный список (можно ID или ответом на сообщение)
 <code>.rm @user</code> — убрать из чёрного списка
 <code>.list</code> — чёрный список
@@ -41,7 +42,29 @@ HELP = """<b>Команды юзербота</b> (сообщение с кома
 <code>.status</code> — состояние бота
 <code>.commands</code> — этот список
 
-Без ссылки <code>.get last/lastI/search</code> работают в текущем чате."""
+Без ссылки <code>.get last/lastI/search</code> и <code>.getM</code> работают в текущем чате."""
+
+
+MEDIA_KINDS = {"photo", "video", "gif", "document", "audio"}
+ALBUM_GROUP = {"photo": "visual", "video": "visual", "document": "file", "audio": "file"}
+
+
+def is_media_file(message) -> bool:
+    return not getattr(message, "action", None) and media_kind(message) in MEDIA_KINDS
+
+
+def media_batches(media: list) -> list:
+    """Делит медиа на альбомы до 10 штук: Telegram не смешивает в альбоме фото с файлами,
+    а GIF в альбом не берёт вовсе."""
+    out, last = [], None
+    for m in media:
+        group = ALBUM_GROUP.get(media_kind(m))
+        if group and group == last and len(out[-1]) < 10:
+            out[-1].append(m)
+        else:
+            out.append([m])
+        last = group
+    return out
 
 
 class UsageError(Exception):
@@ -257,6 +280,54 @@ class Commands:
             return "🔍 Ничего не найдено"
         await self.deliver(ctx, list(reversed(found)), chat)  # от старых к новым
         return None
+
+    # --- .getM -----------------------------------------------------------
+
+    async def cmd_getm(self, args, ctx):
+        limit = self.app.cfg.getm_limit
+        if args and re.fullmatch(r"\d+", args[0]):
+            limit = parse_count(args.pop(0), limit)
+        raw = args[0] if args else None
+
+        link = parse_link(raw) if raw else None
+        if link is not None and link.msg_id is not None:
+            chat = await self.cloner.entity(link.chat)
+            forum = getattr(chat, "forum", False)
+            if link.thread is not None or not forum:
+                # ссылка на сообщение: медиа из него или его альбома
+                message = await self.client.get_messages(chat, ids=link.msg_id)
+                if message is None or getattr(message, "action", None):
+                    return "⚠️ Сообщение не найдено (удалено или нет доступа)"
+                media = [m for m in await self.cloner.album_of(chat, message) if is_media_file(m)]
+                if not media:
+                    return "🔍 В этом сообщении нет видео, фото, GIF или файлов"
+                sent = await self.deliver_media(ctx, media, chat)
+                return f"✅ Отправлено медиа: {sent}"
+
+        chat, thread = await self._target(raw, ctx)
+        media = []
+        async for m in self.client.iter_messages(chat, reply_to=thread):
+            if is_media_file(m):
+                media.append(m)
+                if len(media) >= limit:
+                    break
+        if not media:
+            return "🔍 В чате нет видео, фото, GIF или файлов"
+        sent = await self.deliver_media(ctx, list(reversed(media)), chat)  # от старых к новым
+        note = f" (лимит {limit}, больше: <code>.getM N ссылка</code>)" if len(media) >= limit else ""
+        return f"✅ Отправлено медиа: {sent}{note}"
+
+    async def deliver_media(self, ctx, media: list, chat) -> int:
+        """Отправляет медиа пачками по 10: фото и видео вместе, файлы вместе, GIF по одному."""
+        batches = media_batches(media)
+        title = utils.get_display_name(chat) if chat else ""
+        done = 0
+        for i, batch in enumerate(batches, 1):
+            header = Rich().add(f"📥 {title} · {i}/{len(batches)}") if title else Rich().add(f"📥 {i}/{len(batches)}")
+            await self.cloner.send_copy(ctx.chat, batch, header, reply_to=ctx.topic)
+            done += len(batch)
+            await asyncio.sleep(1)  # бережём лимиты API
+        return done
 
     # --- чёрный список -----------------------------------------------------
 
