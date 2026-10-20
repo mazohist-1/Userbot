@@ -21,6 +21,7 @@ from telethon.tl.types import (  # noqa: E402
     PeerUser, Photo,
 )
 
+from telethon.tl.functions.updates import GetStateRequest  # noqa: E402
 from userbot import config  # noqa: E402
 from userbot.app import App  # noqa: E402
 from userbot.cloner import Cloner, Rich, SkipMessage, media_kind, units  # noqa: E402
@@ -401,6 +402,67 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
         await self.app.catch_up(200, "тест")
         queued = [r[0] for r in self.store.db.execute("SELECT msg_id FROM pending ORDER BY id")]
         self.assertEqual(queued, [20, 21])
+
+
+class OfflineStatusTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = Storage(make_cfg(self.tmp).db_path)
+
+    def make_app(self, **env):
+        app = App(make_cfg(self.tmp, **env), self.store)
+        app.me_id = 42
+        app.cloner = SimpleNamespace(clone_ids={-500})
+        return app
+
+    async def test_client_reports_sends_only(self):
+        from telethon.tl.functions.messages import SendMessageRequest
+        from userbot.app import Client
+        from telethon import TelegramClient
+        calls = []
+        client = Client.__new__(Client)
+        client.on_send = lambda: calls.append(1)
+        orig = TelegramClient.__call__
+        TelegramClient.__call__ = AsyncMock(return_value="ok")
+        try:
+            send = SendMessageRequest(peer=None, message="x")
+            self.assertEqual(await client(send), "ok")
+            await client(GetStateRequest())
+            await client([GetStateRequest(), send])
+        finally:
+            TelegramClient.__call__ = orig
+        self.assertEqual(len(calls), 2)
+
+    async def test_go_offline(self):
+        from telethon.tl.functions.account import UpdateStatusRequest
+        app = self.make_app()
+        app.client = AsyncMock()
+        await app.go_offline(0)
+        req = app.client.await_args.args[0]
+        self.assertIsInstance(req, UpdateStatusRequest)
+        self.assertTrue(req.offline)
+
+    async def test_not_while_user_active(self):
+        app = self.make_app()
+        app.client = AsyncMock()
+        await app.on_own_message(SimpleNamespace(chat_id=-500))  # копия в клон — это бот
+        await app.on_own_message(SimpleNamespace(chat_id=42))    # «Избранное»
+        await app.go_offline(0)
+        self.assertEqual(app.client.await_count, 1)
+        await app.on_own_message(SimpleNamespace(chat_id=7))     # пишете сами
+        await app.go_offline(0)
+        self.assertEqual(app.client.await_count, 1)
+
+    async def test_schedule_debounced_and_switchable(self):
+        app = self.make_app()
+        app.go_offline = AsyncMock()
+        app.schedule_offline()
+        app.schedule_offline()
+        await app._offline_task
+        self.assertEqual(app.go_offline.await_count, 1)
+        off = self.make_app(FORCE_OFFLINE="false")
+        off.schedule_offline()
+        self.assertIsNone(off._offline_task)
 
 
 class CommandsTest(unittest.IsolatedAsyncioTestCase):

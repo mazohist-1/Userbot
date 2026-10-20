@@ -6,6 +6,9 @@ import logging
 import time
 
 from telethon import TelegramClient, errors, events, utils
+from telethon.tl.functions.account import UpdateStatusRequest
+from telethon.tl.functions.messages import (
+    ForwardMessagesRequest, SendMediaRequest, SendMessageRequest, SendMultiMediaRequest)
 from telethon.tl.functions.updates import GetStateRequest
 from telethon.tl.types import MessageService
 
@@ -31,6 +34,11 @@ NETWORK_ERRORS = (ConnectionError, asyncio.TimeoutError)
 PING_INTERVAL = 300       # проверка связи с Telegram, сек
 TICK = 10                 # как часто сторож смотрит на состояние соединения
 MESSAGE_CACHE_LIMIT = 5000
+OFFLINE_DELAY = 2         # через сколько после отправки вернуть статус «не в сети», сек
+ACTIVE_GRACE = 120        # вы сами писали в чат недавно — статус не трогаем, сек
+
+# После этих запросов Telegram может показать аккаунт «в сети»
+SENDING_REQUESTS = (SendMessageRequest, SendMediaRequest, SendMultiMediaRequest, ForwardMessagesRequest)
 
 
 class FatalError(Exception):
@@ -41,8 +49,22 @@ class RestartClient(Exception):
     """Клиент завис или потерял связь — пересоздать его."""
 
 
-def new_client(cfg: Config) -> TelegramClient:
-    return TelegramClient(
+class Client(TelegramClient):
+    """TelegramClient, который сообщает о каждой отправке сообщения через on_send."""
+
+    on_send = None
+
+    async def __call__(self, request, ordered=False, flood_sleep_threshold=None):
+        result = await super().__call__(request, ordered, flood_sleep_threshold)
+        if self.on_send:
+            requests = request if utils.is_list_like(request) else (request,)
+            if any(isinstance(r, SENDING_REQUESTS) for r in requests):
+                self.on_send()
+        return result
+
+
+def new_client(cfg: Config) -> Client:
+    return Client(
         str(cfg.session_path),
         cfg.api_id,
         cfg.api_hash,
@@ -74,6 +96,9 @@ class App:
         self.heartbeat = cfg.data_dir / "heartbeat"
         self._bg: set = set()
         self._bg_error: BaseException | None = None
+        self._offline_task: asyncio.Task | None = None
+        self.own_active_at = 0.0
+        self.client.on_send = self.schedule_offline
 
     # --- запуск ------------------------------------------------------------
 
@@ -102,7 +127,10 @@ class App:
 
         self.client.add_event_handler(self.on_message, events.NewMessage())
         self.client.add_event_handler(self.commands.handle, events.NewMessage(outgoing=True))
+        self.client.add_event_handler(self.on_own_message, events.NewMessage(outgoing=True))
         self._touch_heartbeat()
+        if self.cfg.force_offline:
+            await self.go_offline(0)
 
         log.info("Клонов групп: %d, пересылка из групп: %s, в очереди: %d", len(self.store.sources()),
                  "вкл" if self.store.group_forwarding() else "выкл", self.store.pending_count())
@@ -123,9 +151,37 @@ class App:
                     raise exc
             raise RestartClient(f"задача {next(iter(done)).get_name()} завершилась (клиент отключился)")
         finally:
-            for t in tasks + list(self._bg):
+            extra = [self._offline_task] if self._offline_task else []
+            for t in tasks + list(self._bg) + extra:
                 t.cancel()
-            await asyncio.gather(*tasks, *self._bg, return_exceptions=True)
+            await asyncio.gather(*tasks, *self._bg, *extra, return_exceptions=True)
+
+    # --- статус «не в сети» -----------------------------------------------
+
+    def schedule_offline(self):
+        """Бот что-то отправил: чуть позже снова сказать Telegram, что мы не в сети."""
+        if not self.cfg.force_offline or (self._offline_task and not self._offline_task.done()):
+            return
+        self._offline_task = asyncio.create_task(self.go_offline())
+
+    async def go_offline(self, delay: float = OFFLINE_DELAY):
+        if delay:
+            await asyncio.sleep(delay)
+        if time.time() - self.own_active_at < ACTIVE_GRACE:
+            return  # вы сейчас сами в Telegram — не прячем вас от собеседников
+        try:
+            await self.client(UpdateStatusRequest(offline=True))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug("Не удалось поставить статус «не в сети»: %r", e)
+
+    async def on_own_message(self, event):
+        """Исходящее не в клон и не в «Избранное» — значит, пишете вы сами."""
+        chat_id = event.chat_id
+        if chat_id == self.me_id or (self.cloner and chat_id in self.cloner.clone_ids):
+            return
+        self.own_active_at = time.time()
 
     async def close(self):
         try:

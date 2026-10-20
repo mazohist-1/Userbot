@@ -55,6 +55,7 @@ class Config:
     archive_clones: bool
 
     cmd_reply: str
+    force_offline: bool
     get_limit: int
     getm_limit: int
     getm_scan_limit: int
@@ -103,6 +104,7 @@ def load() -> Config:
         group_clone_prefix=os.getenv("GROUP_CLONE_PREFIX", "Clone: "),
         archive_clones=_bool("ARCHIVE_CLONES", False),
         cmd_reply=cmd_reply,
+        force_offline=_bool("FORCE_OFFLINE", True),
         get_limit=_int("GET_LIMIT", 100),
         getm_limit=_int("GETM_LIMIT", 500),
         getm_scan_limit=_int("GETM_SCAN_LIMIT", 20000),
